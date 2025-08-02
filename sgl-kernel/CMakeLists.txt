@@ -152,6 +152,12 @@ option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
 option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
 option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
+option(SGL_KERNEL_ENABLE_EXPERIMENTAL     "Enable Experimental"     OFF)
+
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
+    set(SGL_KERNEL_ENABLE_EXPERIMENTAL ON)
+endif()
+
 
 if (ENABLE_BELOW_SM90)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -248,7 +254,6 @@ set(SOURCES
     "csrc/moe/ep_moe_silu_and_mul_kernel.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/packbit.cu"
-    "csrc/spatial/greenctx_stream.cu"
     "csrc/speculative/speculative_sampling.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
     "csrc/kvcacheio/transfer.cu"
@@ -398,6 +403,32 @@ if (SGL_KERNEL_ENABLE_FA3)
         list(APPEND FLASH_OPS_COMPILE_DEFS FLASHATTENTION_DISABLE_SM8x)
     endif()
     target_compile_definitions(flash_ops PRIVATE ${FLASH_OPS_COMPILE_DEFS})
+endif()
+
+# set Experimental sources file
+if (SGL_KERNEL_ENABLE_EXPERIMENTAL)
+    set(EXPERIMENTAL_SOURCES
+        "csrc/experimental_extension.cc"
+        "csrc/spatial/greenctx_stream.cu"
+    )
+
+    Python_add_library(experimental_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${EXPERIMENTAL_SOURCES})
+
+    target_compile_options(experimental_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
+    # target_include_directories(experimental_ops PRIVATE
+    #     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
+    #     ${repo-cutlass_SOURCE_DIR}/examples/common
+    #     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
+    # )
+    target_link_libraries(experimental_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+
+    # target_compile_definitions(experimental_ops PRIVATE
+    #     FLASHATTENTION_DISABLE_BACKWARD
+    #     FLASHATTENTION_DISABLE_DROPOUT
+    #     FLASHATTENTION_DISABLE_UNEVEN_K
+    # )
+
+    install(TARGETS experimental_ops LIBRARY DESTINATION sgl_kernel)
 endif()
 
 # JIT Logic

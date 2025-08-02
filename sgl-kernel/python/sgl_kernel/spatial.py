@@ -1,6 +1,13 @@
 import torch
 from torch.cuda.streams import ExternalStream
 
+try:
+    from sgl_kernel import experimental_ops
+except:
+    raise ImportError(
+        "Can not import experimental_ops. Please check your installation."
+    )
+
 
 def create_greenctx_stream_by_value(
     SM_a: int, SM_b: int, device_id: int = None
