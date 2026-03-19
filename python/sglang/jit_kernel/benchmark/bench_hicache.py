@@ -20,6 +20,7 @@ import os
 from dataclasses import dataclass
 from typing import Tuple
 
+from sglang.jit_kernel.alloc import alloc_hugepage_pinned
 import torch
 import triton
 import triton.testing
@@ -35,7 +36,7 @@ from sglang.jit_kernel.hicache import (
 # NOTE: Adjustable hyperparameters for better benchmark stability
 
 # NOTE: torch impl is too slow in benchmark
-DISABLE_TORCH = os.environ.get("DISABLE_TORCH", "0") == "1"
+DISABLE_TORCH = True
 PAGE_SIZE = 1
 ENABLE_SORT = True
 GPU_CACHE_SIZE = 256 * 1024  # 256K tokens on GPU
@@ -410,8 +411,8 @@ if __name__ == "__main__":
     cache = HiCacheCache(
         k_cache_cuda=torch.empty(DEVICE_SHAPE, dtype=torch.bfloat16, device="cuda"),
         v_cache_cuda=torch.empty(DEVICE_SHAPE, dtype=torch.bfloat16, device="cuda"),
-        k_cache_host=torch.empty(HOST_SHAPE, dtype=torch.bfloat16, pin_memory=True),
-        v_cache_host=torch.empty(HOST_SHAPE, dtype=torch.bfloat16, pin_memory=True),
+        k_cache_host=alloc_hugepage_pinned(HOST_SHAPE, dtype=torch.bfloat16),
+        v_cache_host=alloc_hugepage_pinned(HOST_SHAPE, dtype=torch.bfloat16),
     )
 
     print("=" * 60)

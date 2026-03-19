@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     import torch
     from tvm_ffi.module import Module
 
-DEFAULT_BLOCK_QUOTA = 2
+DEFAULT_BLOCK_QUOTA = 4
 
 
 @cache_once
