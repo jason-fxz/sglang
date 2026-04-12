@@ -15,7 +15,12 @@ from sglang.srt.utils import get_device_module
 
 device_module = get_device_module()
 
-from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
+from sglang.jit_kernel.hisparse import (
+    HISPARSE_MODE_FULL,
+    HISPARSE_MODE_PREFETCH,
+    HISPARSE_MODE_RESOLVE,
+    load_cache_to_device_buffer_mla,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
@@ -37,6 +42,9 @@ class HiSparseCoordinator:
         device: str,
         tp_group: torch.distributed.ProcessGroup,
         host_to_device_ratio: int = 2,
+        enable_prefetch: bool = False,
+        prefetch_topk: int | None = None,
+        num_max_prefetch: int | None = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -118,6 +126,44 @@ class HiSparseCoordinator:
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_reqs
+
+        # ── Stage B prefetch state ──
+        self.enable_prefetch = enable_prefetch
+        self.prefetch_topk = prefetch_topk if prefetch_topk is not None else top_k
+        self.num_max_prefetch = (
+            num_max_prefetch if num_max_prefetch is not None else top_k
+        )
+
+        if self.enable_prefetch:
+            self.prefetch_stream = device_module.Stream()
+            # Pre-allocated scratch buffer for probe-topk device-loc output
+            # (unused by attention but required as kernel write target).
+            self.prefetch_topk_device_locs_buffer = torch.full(
+                (max_num_reqs, self.prefetch_topk),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            # Per-layer flag (Python list, constant during graph capture) tracking
+            # whether a prefetch was launched for a given layer in the current step.
+            self._prefetch_launched_for_layer: list[bool] = [False] * layer_num
+
+        # ── Per-kernel stats ──
+        # GPU buffers: per-layer [max_num_reqs, 2] → [hits, misses] per request.
+        # The kernel always writes here (negligible cost: 2 int32 per block).
+        # Stats are read back in map_last_loc_to_buffer (outside the graph).
+        self._resolve_stats_buf = torch.zeros(
+            (layer_num, max_num_reqs, 2), dtype=torch.int32, device=device
+        )
+        self._prefetch_stats_buf = torch.zeros(
+            (layer_num, max_num_reqs, 2), dtype=torch.int32, device=device
+        )
+        # CPU accumulators: per-layer [total_hits, total_misses] across decode steps.
+        self._resolve_stats = [[0, 0] for _ in range(layer_num)]
+        self._prefetch_stats = [[0, 0] for _ in range(layer_num)]
+        self._stats_step_count = 0
+        self._stats_log_interval = 40
+        self._last_num_reqs = 0
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -357,6 +403,11 @@ class HiSparseCoordinator:
         req_pool_indices: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
     ) -> None:
+        # Collect stats from the PREVIOUS step's kernel writes (the GPU
+        # buffers were filled during the last graph replay / forward pass).
+        self._collect_and_maybe_log_stats()
+        self._last_num_reqs = req_pool_indices.size(0)
+
         req_pool_indices_cpu = req_pool_indices.cpu()
 
         self._eager_backup_previous_token(
@@ -375,6 +426,81 @@ class HiSparseCoordinator:
         self.mem_pool_device.full_to_hisparse_device_index_mapping[out_cache_loc] = (
             reserved_buffer_loc
         )
+
+    def _collect_and_maybe_log_stats(self) -> None:
+        """Read per-layer hit/miss stats from GPU and accumulate on CPU.
+
+        Called once per decode step (inside ``map_last_loc_to_buffer``, which
+        runs outside the CUDA graph).  The GPU stats buffers were written by
+        the *previous* step's kernel replays.
+        """
+        num_reqs = self._last_num_reqs
+        if num_reqs == 0:
+            return
+
+        layer_num = self.mem_pool_device.layer_num
+
+        # Read GPU → CPU (small: layer_num × num_reqs × 2 int32).
+        resolve_cpu = (
+            self._resolve_stats_buf[:, :num_reqs, :]
+            .sum(dim=1)  # sum across requests → [layer_num, 2]
+            .cpu()
+        )
+        for lid in range(layer_num):
+            self._resolve_stats[lid][0] += int(resolve_cpu[lid, 0])
+            self._resolve_stats[lid][1] += int(resolve_cpu[lid, 1])
+
+        if self.enable_prefetch:
+            prefetch_cpu = (
+                self._prefetch_stats_buf[:, :num_reqs, :]
+                .sum(dim=1)
+                .cpu()
+            )
+            for lid in range(layer_num):
+                self._prefetch_stats[lid][0] += int(prefetch_cpu[lid, 0])
+                self._prefetch_stats[lid][1] += int(prefetch_cpu[lid, 1])
+
+        self._stats_step_count += 1
+        if self._stats_step_count >= self._stats_log_interval:
+            self._log_and_reset_stats()
+
+    def _log_and_reset_stats(self) -> None:
+        """Log accumulated stats and reset counters."""
+        layer_num = self.mem_pool_device.layer_num
+        steps = self._stats_step_count
+
+        # Build per-layer resolve (on-demand) miss rate.
+        resolve_parts = []
+        for lid in range(layer_num):
+            h, m = self._resolve_stats[lid]
+            total = h + m
+            miss_rate = m / total if total > 0 else 0.0
+            resolve_parts.append(f"L{lid}:{miss_rate:.1%}({m}/{total})")
+
+        logger.info(
+            "HiSparse resolve miss rate (%d steps): %s",
+            steps,
+            " ".join(resolve_parts),
+        )
+
+        if self.enable_prefetch:
+            prefetch_parts = []
+            for lid in range(layer_num):
+                h, m = self._prefetch_stats[lid]
+                total = h + m
+                hit_rate = h / total if total > 0 else 0.0
+                prefetch_parts.append(f"L{lid}:{hit_rate:.1%}({h}/{total})")
+            logger.info(
+                "HiSparse prefetch hit rate (%d steps): %s",
+                steps,
+                " ".join(prefetch_parts),
+            )
+
+        # Reset.
+        for lid in range(layer_num):
+            self._resolve_stats[lid] = [0, 0]
+            self._prefetch_stats[lid] = [0, 0]
+        self._stats_step_count = 0
 
     def _eager_backup_previous_token(
         self,
@@ -595,6 +721,71 @@ class HiSparseCoordinator:
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
 
+    # ── Stage B prefetch API ──────────────────────────────────────────────
+
+    def prefetch_selected_pages(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        probe_topk_result: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        """Run the PREFETCH kernel for *layer_id*.
+
+        The kernel updates residency / LRU state and copies up to
+        ``num_max_prefetch`` missing entries per request from host to device.
+        No ``top_k_device_locs`` output is produced.
+
+        **Caller must already be on ``self.prefetch_stream``** (the
+        ``launch_prefetch`` method in the layer loop handles the stream
+        switch and synchronization).
+        """
+        if not self.enable_prefetch:
+            return
+
+        num_reqs = req_pool_indices.size(0)
+        prefetch_out = self.prefetch_topk_device_locs_buffer[:num_reqs]
+        prefetch_out.fill_(-1)
+
+        block_size = 1024
+        load_cache_to_device_buffer_mla(
+            top_k_tokens=probe_topk_result,
+            device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+            host_cache_locs=self.req_to_host_pool,
+            device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
+            host_cache=self.mem_pool_host.kv_buffer[layer_id],
+            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+            top_k_device_locs=prefetch_out,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            lru_slots=self.lru_slots[layer_id],
+            item_size_bytes=self.mem_pool_host.token_stride_size,
+            num_top_k=self.prefetch_topk,
+            hot_buffer_size=self.device_buffer_size,
+            page_size=1,
+            block_size=block_size,
+            num_real_reqs=self.num_real_reqs,
+            mode=HISPARSE_MODE_PREFETCH,
+            num_max_prefetch=self.num_max_prefetch,
+            stats_out=self._prefetch_stats_buf[layer_id],
+        )
+
+        self._prefetch_launched_for_layer[layer_id] = True
+
+    def _wait_prefetch_if_needed(self, layer_id: int) -> bool:
+        """If a prefetch was launched for *layer_id*, synchronize the current
+        stream to wait for it.  Returns True if a wait was performed."""
+        if (
+            not self.enable_prefetch
+            or not self._prefetch_launched_for_layer[layer_id]
+        ):
+            return False
+        device_module.current_stream().wait_stream(self.prefetch_stream)
+        self._prefetch_launched_for_layer[layer_id] = False
+        return True
+
+    # ────────────────────────────────────────────────────────────────────
+
     def swap_in_selected_pages(
         self,
         req_pool_indices: torch.Tensor,
@@ -602,7 +793,13 @@ class HiSparseCoordinator:
         top_k_result: torch.Tensor,
         layer_id: int,
     ) -> torch.Tensor:
-        """Swap selected top-k tokens into device memory and return their indices."""
+        """Swap selected top-k tokens into device memory and return their indices.
+
+        If a Stage B prefetch was launched for this layer, this call first waits
+        for the prefetch stream to finish and then runs the kernel in RESOLVE
+        mode (which naturally treats prefetched tokens as hits).  Otherwise the
+        FULL mode is used as before.
+        """
         # The CUDA kernel expects req_pool_indices as int64 and seq_lens as int32 or int64.
         if req_pool_indices.dtype != torch.int64:
             raise ValueError(
@@ -616,6 +813,10 @@ class HiSparseCoordinator:
             raise ValueError(
                 f"top_k_result dtype {top_k_result.dtype} is not int32 as expected"
             )
+
+        # If prefetch was launched, wait for it and use RESOLVE mode.
+        had_prefetch = self._wait_prefetch_if_needed(layer_id)
+        mode = HISPARSE_MODE_RESOLVE if had_prefetch else HISPARSE_MODE_FULL
 
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
@@ -639,5 +840,8 @@ class HiSparseCoordinator:
             page_size=1,
             block_size=block_size,
             num_real_reqs=self.num_real_reqs,
+            mode=mode,
+            num_max_prefetch=0,
+            stats_out=self._resolve_stats_buf[layer_id],
         )
         return top_k_indices

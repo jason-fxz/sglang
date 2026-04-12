@@ -643,6 +643,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     else self.tp_group.cpu_group
                 ),
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                enable_prefetch=hisparse_cfg.enable_prefetch,
+                prefetch_topk=hisparse_cfg.prefetch_topk,
+                num_max_prefetch=hisparse_cfg.num_max_prefetch,
             )
 
         # Init routed experts capturer

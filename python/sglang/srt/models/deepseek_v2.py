@@ -1765,6 +1765,81 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         return hidden_states, residual, topk_indices
 
+    # ── Stage B prefetch ──────────────────────────────────────────────
+
+    def compute_probe_input(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Default probe-input strategy: ``input_layernorm(hidden_states + residual)``.
+
+        Override or swap this method to experiment with different probe-input
+        approximations (e.g. skipping layernorm for speed, using only one of
+        hidden_states / residual, etc.).
+        """
+        if residual is not None:
+            x = hidden_states + residual
+        else:
+            x = hidden_states
+        # Single-arg call — does NOT mutate residual in-place.
+        return self.input_layernorm(x)
+
+    def compute_probe_q_lora(
+        self,
+        probe_x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Derive ``q_lora`` from probe input for the next-layer indexer."""
+        attn = self.self_attn
+        qkv = attn.fused_qkv_a_proj_with_mqa(probe_x)[0]
+        q_raw = qkv[..., : attn.q_lora_rank]
+        return attn.q_a_layernorm(q_raw)
+
+    def launch_prefetch(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        positions: torch.Tensor,
+        forward_batch: "ForwardBatch",
+    ) -> None:
+        """Launch Stage B prefetch for *this* layer.
+
+        Caller responsibility: only invoke this when all preconditions hold
+        (decode mode, enable_prefetch, layer_id > 0, use_nsa).  The method
+        runs the probe indexer + prefetch kernel on the coordinator's
+        prefetch stream.
+        """
+        coordinator = forward_batch.hisparse_coordinator
+        attn = self.self_attn
+
+        # 1) Construct probe input on the *current* stream (cheap).
+        probe_x = self.compute_probe_input(hidden_states, residual)
+        q_lora = self.compute_probe_q_lora(probe_x)
+
+        # 2) Switch to prefetch stream for the indexer + swap kernel.
+        prefetch_stream = coordinator.prefetch_stream
+        current_stream = torch.cuda.current_stream()
+        prefetch_stream.wait_stream(current_stream)
+
+        with torch.cuda.stream(prefetch_stream):
+            probe_topk = attn.indexer.forward_probe(
+                x=probe_x,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=self.layer_id,
+                prefetch_topk=coordinator.prefetch_topk,
+            )
+            if probe_topk is not None:
+                coordinator.prefetch_selected_pages(
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    seq_lens=forward_batch.seq_lens,
+                    probe_topk_result=probe_topk,
+                    layer_id=self.layer_id,
+                )
+
+    # ──────────────────────────────────────────────────────────────────
+
     def op_comm_prepare_attn(
         self,
         state,
@@ -2068,6 +2143,19 @@ class DeepseekV2Model(nn.Module):
                     llama_4_scaling,
                     prev_topk_indices=topk_indices,
                 )
+
+                # ── Stage B prefetch: probe next layer's top-k and prefetch KV ──
+                if (
+                    forward_batch.hisparse_coordinator is not None
+                    and forward_batch.hisparse_coordinator.enable_prefetch
+                    and forward_batch.forward_mode.is_decode_or_idle()
+                    and i + 1 < normal_end_layer
+                ):
+                    next_layer = self.layers[i + 1]
+                    if getattr(next_layer.self_attn, "use_nsa", False):
+                        next_layer.launch_prefetch(
+                            hidden_states, residual, positions, forward_batch
+                        )
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(

@@ -89,6 +89,20 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     min_sparse_prompt_len = extra_config.pop("min_sparse_prompt_len", None)
     page_size = extra_config.pop("page_size", None)
 
+    # HiSparse Stage B prefetch knobs.
+    enable_prefetch = bool(extra_config.pop("enable_prefetch", False))
+    prefetch_topk = extra_config.pop("prefetch_topk", None)
+    num_max_prefetch = extra_config.pop("num_max_prefetch", None)
+    if prefetch_topk is not None and prefetch_topk > top_k:
+        raise ValueError(
+            f"prefetch_topk ({prefetch_topk}) must be <= top_k ({top_k}) "
+            f"so the same kernel template can be reused"
+        )
+    if num_max_prefetch is not None and num_max_prefetch < 0:
+        raise ValueError(
+            f"num_max_prefetch ({num_max_prefetch}) must be non-negative"
+        )
+
     return SparseConfig(
         top_k=top_k,
         device_buffer_size=device_buffer_size,
@@ -97,6 +111,9 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         backend=backend,
         page_size=page_size,
         min_sparse_prompt_len=min_sparse_prompt_len,
+        enable_prefetch=enable_prefetch,
+        prefetch_topk=prefetch_topk,
+        num_max_prefetch=num_max_prefetch,
         sparse_extra_config=extra_config,
     )
 

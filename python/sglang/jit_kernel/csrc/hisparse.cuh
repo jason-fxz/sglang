@@ -66,11 +66,22 @@ struct SmemLayout {
   static constexpr size_t BYTES = TOTAL_INT32 * sizeof(int32_t) + TOTAL_INT16 * sizeof(int16_t);
 };
 
+// Mode selects between the Stage B prefetch and the regular swap-in path.
+// FULL: existing behavior (prefetch was not run earlier; resolve all misses, write top_k_device_locs).
+// PREFETCH: Stage B prefetch — cap H2D copies at num_max_prefetch and skip top_k_device_locs writes.
+// RESOLVE: regular swap-in after a previous PREFETCH on the same layer; identical to FULL since the
+//          shared kernel logic is naturally idempotent w.r.t. tokens already promoted into the buffer.
+enum HiSparseMode {
+  HISPARSE_MODE_FULL = 0,
+  HISPARSE_MODE_PREFETCH = 1,
+  HISPARSE_MODE_RESOLVE = 2,
+};
+
 // Each block processes one request
 // req_pool_indices are int64_t (pool indices can be large), seq_lens can be int32_t or int64_t
 // Layout: [HOT_BUFFER_SIZE slots for LRU] + [page_size slots for newest token]
 // newest_slot is at HOT_BUFFER_SIZE (first position of extra page)
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, typename SeqLensT>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, int Mode, typename SeqLensT>
 __global__ void load_cache_to_device_buffer_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
@@ -91,7 +102,13 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
     int64_t page_size,
-    int64_t item_size_bytes) {
+    int64_t item_size_bytes,
+    int32_t num_max_prefetch,
+    int32_t* __restrict__ stats_out) {
+    // stats_out: optional (may be nullptr). If non-null, shape [bs, 2]:
+    //   stats_out[bid*2 + 0] = number of hits (incl. newest_hit)
+    //   stats_out[bid*2 + 1] = number of misses (actual H2D copies)
+  constexpr bool kWriteOutLocs = (Mode != HISPARSE_MODE_PREFETCH);
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
   constexpr int NUM_TOKEN_CHUNKS = (NUM_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
@@ -121,12 +138,21 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   // Fast path: short sequences have all tokens in the device buffer in order.
   if (seq_len <= HOT_BUFFER_SIZE) {
-    const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
-    for (int i = tid; i < count; i += BLOCK_SIZE) {
-      int32_t token_pos = req_top_k_tokens[i];
-      if (token_pos >= 0) {
-        req_top_k_device_locs[i] = req_device_buffer_locs[token_pos];
+    if (kWriteOutLocs) {
+      const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
+      for (int i = tid; i < count; i += BLOCK_SIZE) {
+        int32_t token_pos = req_top_k_tokens[i];
+        if (token_pos >= 0) {
+          req_top_k_device_locs[i] = req_device_buffer_locs[token_pos];
+        }
       }
+    }
+    // PREFETCH on a short seq is a no-op: nothing needs to be loaded from host.
+    // Stats: all tokens are resident — zero misses.
+    if (tid == 0 && stats_out != nullptr) {
+      int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
+      stats_out[bid * 2 + 0] = count;  // hits
+      stats_out[bid * 2 + 1] = 0;      // misses
     }
     return;
   }
@@ -179,7 +205,9 @@ __global__ void load_cache_to_device_buffer_kernel(
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
       s_top_k_tokens[i] = TOKEN_HIT;
-      req_top_k_device_locs[i] = req_device_buffer_locs[newest_slot];
+      if (kWriteOutLocs) {
+        req_top_k_device_locs[i] = req_device_buffer_locs[newest_slot];
+      }
       s_newest_hit = 1;
     } else {
       int slot = hash_slot(token_idx, HASH_SIZE);
@@ -226,7 +254,9 @@ __global__ void load_cache_to_device_buffer_kernel(
     // Record hits
     if (is_hit) {
       s_top_k_tokens[my_found_top_k_idx] = TOKEN_HIT;
-      req_top_k_device_locs[my_found_top_k_idx] = req_device_buffer_locs[buf_slot];
+      if (kWriteOutLocs) {
+        req_top_k_device_locs[my_found_top_k_idx] = req_device_buffer_locs[buf_slot];
+      }
     }
 
     int local_hit_offset = 0;
@@ -326,17 +356,35 @@ __global__ void load_cache_to_device_buffer_kernel(
 
     if (is_miss) {
       int miss_offset = s_chunk_offset[chunk_idx] + local_miss_offset;
-      int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_offset];
       // Reuse s_top_k_tokens as miss scratch: miss_offset < my_token_idx always
       // holds (hits are skipped), so compacted writes never overrun pending reads.
-      s_top_k_tokens[miss_offset] = my_token;
-      req_top_k_device_locs[my_token_idx] = req_device_buffer_locs[evict_slot];
-      req_device_buffer_tokens[evict_slot] = my_token;
+      // PREFETCH mode: cap eviction + buffer-token mutation at num_max_prefetch so the
+      // remaining miss slots stay untouched and the later RESOLVE call can claim them.
+      const bool within_prefetch_cap =
+          (Mode != HISPARSE_MODE_PREFETCH) || (miss_offset < num_max_prefetch);
+      if (within_prefetch_cap) {
+        int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_offset];
+        s_top_k_tokens[miss_offset] = my_token;
+        if (kWriteOutLocs) {
+          req_top_k_device_locs[my_token_idx] = req_device_buffer_locs[evict_slot];
+        }
+        req_device_buffer_tokens[evict_slot] = my_token;
+      }
     }
   }
   __syncthreads();
 
   total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  if constexpr (Mode == HISPARSE_MODE_PREFETCH) {
+    if (total_misses > num_max_prefetch) {
+      total_misses = num_max_prefetch;
+    }
+  }
+  // Export per-request stats: hits (incl. newest) and actual misses (H2D copies).
+  if (tid == 0 && stats_out != nullptr) {
+    stats_out[bid * 2 + 0] = s_total_hits + s_newest_hit;
+    stats_out[bid * 2 + 1] = total_misses;
+  }
   // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
   for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
     const int32_t miss_token = s_top_k_tokens[miss_idx];
@@ -357,7 +405,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
 }
 
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, int Mode>
 void load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -373,7 +421,9 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView lru_slots,
     tvm::ffi::TensorView num_real_reqs,
     int64_t page_size,
-    int64_t item_size_bytes) {
+    int64_t item_size_bytes,
+    int64_t num_max_prefetch,
+    tvm::ffi::TensorView stats_out) {
   using namespace host;
 
   const int64_t bs = top_k_tokens.shape()[0];
@@ -383,6 +433,11 @@ void load_cache_to_device_buffer(
   const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
   const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
   const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
+
+  // stats_out is optional: pass nullptr when ndim==0 (empty tensor).
+  int32_t* stats_ptr = (stats_out.ndim() > 0 && stats_out.shape()[0] > 0)
+      ? static_cast<int32_t*>(stats_out.data_ptr())
+      : nullptr;
 
   // Generic lambda: both int32 and int64 kernel variants are compiled;
   // the correct one is selected at runtime based on seq_lens dtype.
@@ -412,17 +467,19 @@ void load_cache_to_device_buffer(
         top_k_tokens_stride,
         top_k_device_locs_stride,
         page_size,
-        item_size_bytes);
+        item_size_bytes,
+        static_cast<int32_t>(num_max_prefetch),
+        stats_ptr);
   };
 
   const auto dtype = seq_lens.dtype();
   if (dtype.code == kDLInt && dtype.bits == 64) {
     launch(
-        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, int64_t>,
+        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, Mode, int64_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()));
   } else {
     launch(
-        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, int32_t>,
+        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, Mode, int32_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()));
   }
 }

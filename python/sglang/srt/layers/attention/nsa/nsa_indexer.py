@@ -388,6 +388,7 @@ class Indexer(MultiPlatformOp):
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
+        topk: int | None = None,
     ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
@@ -481,7 +482,7 @@ class Indexer(MultiPlatformOp):
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        topk_result = metadata.topk_transform(logits, topk if topk is not None else self.index_topk)
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
@@ -1229,6 +1230,114 @@ class Indexer(MultiPlatformOp):
                 topk=self.index_topk,
                 layer_id=layer_id,
             )
+        return topk_result
+
+    # ── Lightweight probe path for Stage B prefetch ──────────────────
+    def _get_q_only_bf16(
+        self,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute only the query (no key) for the probe path."""
+        query, _ = self.wq_b(q_lora)
+        query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
+        q_rope, _ = torch.split(
+            query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        )
+        # RoPE needs both q and k tensors; pass q_rope as dummy k.
+        q_rope, _ = self.rotary_emb(positions, q_rope, q_rope)
+        query[..., : self.rope_head_dim] = q_rope.clone()
+        query = rotate_activation(query)
+        return query
+
+    def forward_probe(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        prefetch_topk: int | None = None,
+    ) -> torch.Tensor | None:
+        """Lightweight indexer pass for Stage B prefetch.
+
+        Produces only ``topk_indices``; skips all K-side computation and
+        ``_store_index_k_cache``.  Intended to run on a prefetch stream
+        concurrently with the main model forward.
+
+        Args:
+            prefetch_topk: if not None, override the top-k size for the probe.
+        """
+        if not (_is_cuda or _is_hip):
+            return None
+
+        if _is_hip:
+            from sglang.srt.layers.attention.nsa.tilelang_kernel import act_quant
+        else:
+            from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+
+        x_meta = x[0] if isinstance(x, tuple) else x
+        metadata = forward_batch.attn_backend.get_indexer_metadata(
+            layer_id, forward_batch
+        )
+        if metadata is None:
+            return None
+
+        topk = prefetch_topk if prefetch_topk is not None else self.index_topk
+
+        # Query only — no key, no store.
+        query = self._get_q_only_bf16(q_lora, positions)
+        q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+
+        # Head gates / weights.
+        if isinstance(x, tuple):
+            assert len(x) in (2, 3)
+            x_q, x_s = x[0], x[1]
+            if (
+                x_s is not None
+                and x_q.dim() == 2
+                and x_s.dim() == 2
+                and x_q.shape[0] == x_s.shape[0]
+            ):
+                m, n = x_q.shape
+                ng = x_s.shape[1]
+                if ng > 0 and n % ng == 0:
+                    group = n // ng
+                    x_for_gate = (
+                        x_q.to(torch.float32)
+                        .view(m, ng, group)
+                        .mul_(x_s.to(torch.float32).unsqueeze(-1))
+                        .view(m, n)
+                        .to(torch.bfloat16)
+                    )
+                else:
+                    x_for_gate = x_q.to(torch.bfloat16)
+            else:
+                x_for_gate = x_q.to(torch.bfloat16)
+        else:
+            x_for_gate = x
+
+        weights = self._get_logits_head_gate(x_for_gate, q_scale)
+
+        # Top-k via paged MQA logits (decode path).
+        if forward_batch.seq_lens_cpu is not None and len(forward_batch.seq_lens_cpu) == 0:
+            return torch.full(
+                (x_meta.shape[0], topk), -1, dtype=torch.int, device=x_meta.device
+            )
+
+        # _get_topk_paged → topk_transform may use a fused kernel that only
+        # supports the model's native index_topk (e.g. 2048 for DS-V3.2).
+        # When prefetch_topk < index_topk, compute full index_topk then truncate.
+        if topk < self.index_topk:
+            topk_result = self._get_topk_paged(
+                forward_batch, layer_id, q_fp8, weights, metadata
+            )
+            topk_result = topk_result[:, :topk]
+        else:
+            topk_result = self._get_topk_paged(
+                forward_batch, layer_id, q_fp8, weights, metadata, topk=topk
+            )
+
         return topk_result
 
     def forward_npu(

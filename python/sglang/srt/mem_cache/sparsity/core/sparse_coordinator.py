@@ -62,6 +62,10 @@ class SparseConfig:
     backend: Optional[str] = None
     page_size: Optional[int] = None
     min_sparse_prompt_len: Optional[int] = None
+    # HiSparse Stage B prefetch knobs.
+    enable_prefetch: bool = False
+    prefetch_topk: Optional[int] = None  # default: top_k
+    num_max_prefetch: Optional[int] = None  # default: top_k (no effective cap)
     sparse_extra_config: dict = field(
         default_factory=dict
     )  # Algorithm-specific config, parsed by each algorithm
