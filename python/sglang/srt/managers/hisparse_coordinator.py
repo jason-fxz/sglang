@@ -91,6 +91,7 @@ class HiSparseCoordinator:
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        self.tp_rank = torch.distributed.get_rank(group=self.tp_group)
 
         # initialize data structures for swap-in kernel
         layer_num = self.mem_pool_device.layer_num
@@ -441,14 +442,15 @@ class HiSparseCoordinator:
         layer_num = self.mem_pool_device.layer_num
 
         # Read GPU → CPU (small: layer_num × num_reqs × 2 int32).
+        # Kernel stats layout: [0] = misses (swap-in count), [1] = NUM_TOP_K.
         resolve_cpu = (
             self._resolve_stats_buf[:, :num_reqs, :]
             .sum(dim=1)  # sum across requests → [layer_num, 2]
             .cpu()
         )
         for lid in range(layer_num):
-            self._resolve_stats[lid][0] += int(resolve_cpu[lid, 0])
-            self._resolve_stats[lid][1] += int(resolve_cpu[lid, 1])
+            self._resolve_stats[lid][0] += int(resolve_cpu[lid, 0])  # misses
+            self._resolve_stats[lid][1] += int(resolve_cpu[lid, 1])  # total_topk
 
         if self.enable_prefetch:
             prefetch_cpu = (
@@ -461,42 +463,76 @@ class HiSparseCoordinator:
                 self._prefetch_stats[lid][1] += int(prefetch_cpu[lid, 1])
 
         self._stats_step_count += 1
-        if self._stats_step_count >= self._stats_log_interval:
-            self._log_and_reset_stats()
 
     def _log_and_reset_stats(self) -> None:
-        """Log accumulated stats and reset counters."""
+        """Log accumulated stats and reset counters.  Only logs on TP rank 0."""
+        if self.tp_rank != 0:
+            self._reset_stats()
+            return
+
         layer_num = self.mem_pool_device.layer_num
         steps = self._stats_step_count
+        if steps == 0:
+            return
 
-        # Build per-layer resolve (on-demand) miss rate.
-        resolve_parts = []
+        # Collect per-layer resolve miss rates and overall average.
+        # Stats layout: [0] = misses (swap-in count), [1] = total_topk.
+        total_misses_all = 0
+        total_topk_all = 0
+        miss_rates = []
         for lid in range(layer_num):
-            h, m = self._resolve_stats[lid]
-            total = h + m
-            miss_rate = m / total if total > 0 else 0.0
-            resolve_parts.append(f"L{lid}:{miss_rate:.1%}({m}/{total})")
+            misses, total_topk = self._resolve_stats[lid]
+            total_misses_all += misses
+            total_topk_all += total_topk
+            miss_rates.append(misses / total_topk if total_topk > 0 else 0.0)
+
+        avg_miss = total_misses_all / total_topk_all if total_topk_all > 0 else 0.0
+
+        # Per-layer detail: group into rows of 10 for readability.
+        layer_lines = []
+        for start in range(0, layer_num, 10):
+            end = min(start + 10, layer_num)
+            parts = [f"L{lid:>2d}:{miss_rates[lid]:5.1%}" for lid in range(start, end)]
+            layer_lines.append("  " + "  ".join(parts))
 
         logger.info(
-            "HiSparse resolve miss rate (%d steps): %s",
+            "HiSparse resolve miss rate (%d steps, avg=%s):\n%s",
             steps,
-            " ".join(resolve_parts),
+            f"{avg_miss:.1%}",
+            "\n".join(layer_lines),
         )
 
         if self.enable_prefetch:
-            prefetch_parts = []
+            pfx_misses_all = 0
+            pfx_topk_all = 0
+            hit_rates = []
             for lid in range(layer_num):
-                h, m = self._prefetch_stats[lid]
-                total = h + m
-                hit_rate = h / total if total > 0 else 0.0
-                prefetch_parts.append(f"L{lid}:{hit_rate:.1%}({h}/{total})")
+                misses, total_topk = self._prefetch_stats[lid]
+                pfx_misses_all += misses
+                pfx_topk_all += total_topk
+                hit_rate = 1.0 - (misses / total_topk) if total_topk > 0 else 0.0
+                hit_rates.append(hit_rate)
+
+            avg_hit = 1.0 - (pfx_misses_all / pfx_topk_all) if pfx_topk_all > 0 else 0.0
+
+            pfx_lines = []
+            for start in range(0, layer_num, 10):
+                end = min(start + 10, layer_num)
+                parts = [f"L{lid:>2d}:{hit_rates[lid]:5.1%}" for lid in range(start, end)]
+                pfx_lines.append("  " + "  ".join(parts))
+
             logger.info(
-                "HiSparse prefetch hit rate (%d steps): %s",
+                "HiSparse prefetch hit rate (%d steps, avg=%s):\n%s",
                 steps,
-                " ".join(prefetch_parts),
+                f"{avg_hit:.1%}",
+                "\n".join(pfx_lines),
             )
 
-        # Reset.
+        self._reset_stats()
+
+    def _reset_stats(self) -> None:
+        """Reset stat counters."""
+        layer_num = self.mem_pool_device.layer_num
         for lid in range(layer_num):
             self._resolve_stats[lid] = [0, 0]
             self._prefetch_stats[lid] = [0, 0]
@@ -692,6 +728,10 @@ class HiSparseCoordinator:
             self.request_finished(req)
 
     def request_finished(self, req: Req):
+        # Flush accumulated stats when the request ends (IDLE).
+        self._collect_and_maybe_log_stats()
+        self._log_and_reset_stats()
+
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)

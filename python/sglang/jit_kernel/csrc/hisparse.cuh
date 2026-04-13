@@ -106,8 +106,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     int32_t num_max_prefetch,
     int32_t* __restrict__ stats_out) {
     // stats_out: optional (may be nullptr). If non-null, shape [bs, 2]:
-    //   stats_out[bid*2 + 0] = number of hits (incl. newest_hit)
-    //   stats_out[bid*2 + 1] = number of misses (actual H2D copies)
+    //   stats_out[bid*2 + 0] = misses  (KV entries that needed H2D swap-in)
+    //   stats_out[bid*2 + 1] = NUM_TOP_K (constant denominator for miss-rate)
   constexpr bool kWriteOutLocs = (Mode != HISPARSE_MODE_PREFETCH);
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
@@ -148,11 +148,10 @@ __global__ void load_cache_to_device_buffer_kernel(
       }
     }
     // PREFETCH on a short seq is a no-op: nothing needs to be loaded from host.
-    // Stats: all tokens are resident — zero misses.
+    // Stats: [0] = misses (swap-in), [1] = NUM_TOP_K.
     if (tid == 0 && stats_out != nullptr) {
-      int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
-      stats_out[bid * 2 + 0] = count;  // hits
-      stats_out[bid * 2 + 1] = 0;      // misses
+      stats_out[bid * 2 + 0] = 0;          // misses
+      stats_out[bid * 2 + 1] = NUM_TOP_K;  // total_topk
     }
     return;
   }
@@ -201,7 +200,14 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
-    if (token_idx == newest_token) {
+    if (token_idx < 0) {
+      // Padding sentinel (-1): treat as a no-op hit so it never becomes a
+      // miss and triggers an out-of-bounds host memory access.
+      s_top_k_tokens[i] = TOKEN_HIT;
+      if (kWriteOutLocs) {
+        req_top_k_device_locs[i] = -1;
+      }
+    } else if (token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
       s_top_k_tokens[i] = TOKEN_HIT;
@@ -374,16 +380,28 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  // Broadcast total_misses from warp-0 (which ran the prefix scan) to all
+  // threads via shared memory.  The old formula (NUM_TOP_K - s_total_hits -
+  // s_newest_hit) is wrong when HOT_BUFFER_SIZE > NUM_TOP_K because duplicate
+  // buffer tokens can inflate s_total_hits beyond NUM_TOP_K.
+  if (tid == 0) {
+    // Reuse s_total_hits as broadcast slot (no longer needed after this point).
+    s_total_hits = total_misses;
+  }
+  __syncthreads();
+  total_misses = s_total_hits;
+
   if constexpr (Mode == HISPARSE_MODE_PREFETCH) {
     if (total_misses > num_max_prefetch) {
       total_misses = num_max_prefetch;
     }
   }
-  // Export per-request stats: hits (incl. newest) and actual misses (H2D copies).
+  // Export per-request stats:
+  //   [0] = misses  (KV entries that needed H2D swap-in)
+  //   [1] = NUM_TOP_K (constant, for miss-rate = misses / NUM_TOP_K)
   if (tid == 0 && stats_out != nullptr) {
-    stats_out[bid * 2 + 0] = s_total_hits + s_newest_hit;
-    stats_out[bid * 2 + 1] = total_misses;
+    stats_out[bid * 2 + 0] = total_misses;
+    stats_out[bid * 2 + 1] = NUM_TOP_K;
   }
   // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
   for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {

@@ -3,13 +3,14 @@
 set -euo pipefail
 
 HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-30000}"
+PORT="${PORT:-30304}"
 BASE_URL="${BASE_URL:-http://${HOST}:${PORT}}"
-MODEL="${MODEL:-/home/ubuntu/workspace/models/DeepSeek-V3.2}"
+MODEL="${MODEL:-/data/dark/tmp/workspace/DeepSeekV3.2}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 PROMPT="${PROMPT:-}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 MAX_TOKENS="${MAX_TOKENS:-768}"
+DECODE_TOKENS="${DECODE_TOKENS:-${MAX_TOKENS}}"
 THINKING="${THINKING:-true}"
 SEPARATE_REASONING="${SEPARATE_REASONING:-true}"
 SEED="${SEED:-42}"
@@ -17,6 +18,7 @@ NUM_RUNS="${NUM_RUNS:-2}"
 SHOW_RAW_RESPONSE="${SHOW_RAW_RESPONSE:-0}"
 USE_LONG_CONTEXT_DEFAULT="${USE_LONG_CONTEXT_DEFAULT:-1}"
 LONG_CONTEXT_BLOCKS="${LONG_CONTEXT_BLOCKS:-96}"
+PREFILL_TOKENS="${PREFILL_TOKENS:-}"
 TARGET_BLOCK_INDEX="${TARGET_BLOCK_INDEX:-63}"
 OUTPUT_LINE_COUNT="${OUTPUT_LINE_COUNT:-96}"
 
@@ -32,24 +34,30 @@ payload="$(
   SYSTEM_PROMPT="${SYSTEM_PROMPT}" \
   PROMPT="${PROMPT}" \
   TEMPERATURE="${TEMPERATURE}" \
-  MAX_TOKENS="${MAX_TOKENS}" \
+  DECODE_TOKENS="${DECODE_TOKENS}" \
   THINKING="${THINKING}" \
   SEPARATE_REASONING="${SEPARATE_REASONING}" \
   SEED="${SEED}" \
   USE_LONG_CONTEXT_DEFAULT="${USE_LONG_CONTEXT_DEFAULT}" \
   LONG_CONTEXT_BLOCKS="${LONG_CONTEXT_BLOCKS}" \
+  PREFILL_TOKENS="${PREFILL_TOKENS}" \
   TARGET_BLOCK_INDEX="${TARGET_BLOCK_INDEX}" \
   OUTPUT_LINE_COUNT="${OUTPUT_LINE_COUNT}" \
   python3 - <<'PY'
 import json
 import os
+from pathlib import Path
+
+from transformers import AutoTokenizer
 
 
 def parse_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def build_long_context_prompt(num_blocks: int, target_idx: int, output_line_count: int) -> str:
+def build_long_context_prompt(
+    num_blocks: int, target_idx: int, output_line_count: int
+) -> str:
     target_idx = max(0, min(target_idx, num_blocks - 1))
     lines = [
         "Below is a long retrieval context used to exercise HiSparse during decode.",
@@ -77,33 +85,109 @@ def build_long_context_prompt(num_blocks: int, target_idx: int, output_line_coun
     return "\n".join(lines)
 
 
+def build_prefill_target_prompt(
+    model: str, target_tokens: int, target_idx: int, output_line_count: int
+) -> str:
+    target_tokens = max(1, target_tokens)
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+
+    low = 1
+    high = 1
+    prompt = build_long_context_prompt(high, target_idx, output_line_count)
+    token_count = len(tokenizer.encode(prompt, add_special_tokens=False))
+
+    while token_count < target_tokens:
+        low = high + 1
+        high *= 2
+        prompt = build_long_context_prompt(high, target_idx, output_line_count)
+        token_count = len(tokenizer.encode(prompt, add_special_tokens=False))
+
+    best_prompt = prompt
+    best_distance = abs(token_count - target_tokens)
+
+    left = max(1, low)
+    right = high
+    while left <= right:
+        mid = (left + right) // 2
+        prompt = build_long_context_prompt(mid, target_idx, output_line_count)
+        token_count = len(tokenizer.encode(prompt, add_special_tokens=False))
+        distance = abs(token_count - target_tokens)
+        if distance <= best_distance:
+            best_prompt = prompt
+            best_distance = distance
+        if token_count < target_tokens:
+            left = mid + 1
+        elif token_count > target_tokens:
+            right = mid - 1
+        else:
+            return prompt
+
+    return best_prompt
+
+
+def infer_model_type(model: str) -> str | None:
+    config_path = Path(model) / "config.json"
+    if not config_path.exists():
+        return None
+    with config_path.open(encoding="utf-8") as f:
+        return json.load(f).get("model_type")
+
+
+def render_prompt(messages, model: str, thinking: bool) -> str:
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    thinking_mode = "thinking" if thinking else "chat"
+
+    if infer_model_type(model) == "deepseek_v32":
+        from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
+
+        return encode_messages(messages, thinking_mode=thinking_mode)
+
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        return_dict=False,
+        thinking=thinking,
+    )
+
+
 messages = []
 system_prompt = os.environ.get("SYSTEM_PROMPT", "")
 if system_prompt:
     messages.append({"role": "system", "content": system_prompt})
 
 prompt = os.environ.get("PROMPT", "")
-if not prompt and parse_bool(os.environ["USE_LONG_CONTEXT_DEFAULT"]):
+prefill_tokens = os.environ.get("PREFILL_TOKENS", "").strip()
+if not prompt and prefill_tokens:
+    prompt = build_prefill_target_prompt(
+        os.environ["MODEL"],
+        int(prefill_tokens),
+        int(os.environ["TARGET_BLOCK_INDEX"]),
+        int(os.environ["OUTPUT_LINE_COUNT"]),
+    )
+elif not prompt and parse_bool(os.environ["USE_LONG_CONTEXT_DEFAULT"]):
     prompt = build_long_context_prompt(
         int(os.environ["LONG_CONTEXT_BLOCKS"]),
         int(os.environ["TARGET_BLOCK_INDEX"]),
         int(os.environ["OUTPUT_LINE_COUNT"]),
     )
 elif not prompt:
-    prompt = "请简单介绍一下 HiSparse 的作用。"
+    prompt = "Please briefly explain the purpose of HiSparse."
 
 messages.append({"role": "user", "content": prompt})
+rendered_prompt = render_prompt(
+    messages,
+    os.environ["MODEL"],
+    parse_bool(os.environ["THINKING"]),
+)
 
 body = {
-    "model": os.environ["MODEL"],
-    "messages": messages,
-    "temperature": float(os.environ["TEMPERATURE"]),
-    "max_tokens": int(os.environ["MAX_TOKENS"]),
-    "seed": int(os.environ["SEED"]),
-    "chat_template_kwargs": {
-        "thinking": parse_bool(os.environ["THINKING"]),
+    "text": rendered_prompt,
+    "sampling_params": {
+        "temperature": float(os.environ["TEMPERATURE"]),
+        "max_new_tokens": int(os.environ["DECODE_TOKENS"]),
+        "sampling_seed": int(os.environ["SEED"]),
     },
-    "separate_reasoning": parse_bool(os.environ["SEPARATE_REASONING"]),
 }
 
 print(json.dumps(body, ensure_ascii=False))
@@ -115,7 +199,7 @@ trap 'rm -rf "${tmp_dir}"' EXIT
 
 for run_idx in $(seq 1 "${NUM_RUNS}"); do
   curl -sS \
-    -X POST "${BASE_URL}/v1/chat/completions" \
+    -X POST "${BASE_URL}/generate" \
     -H 'Content-Type: application/json' \
     --data-binary "${payload}" \
     > "${tmp_dir}/response_${run_idx}.json"
@@ -124,12 +208,16 @@ done
 TMP_DIR="${tmp_dir}" \
 NUM_RUNS="${NUM_RUNS}" \
 SHOW_RAW_RESPONSE="${SHOW_RAW_RESPONSE}" \
+SEPARATE_REASONING="${SEPARATE_REASONING}" \
+MODEL="${MODEL}" \
 python3 - <<'PY'
 import hashlib
 import json
 import os
 import sys
 from pathlib import Path
+
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 
 
 def short_hash(text):
@@ -142,15 +230,26 @@ def preview(text, limit=120):
 
 
 def extract_response(resp):
-    if "choices" not in resp or not resp["choices"]:
+    if "text" not in resp:
         return {"raw": resp}
-    choice = resp["choices"][0]
-    message = choice.get("message", {})
+    text = resp.get("text") or ""
+    reasoning = ""
+    content = text
+    model_is_deepseek_v32 = "deepseekv3.2" in os.environ["MODEL"].lower() or "deepseek_v32" in os.environ["MODEL"].lower()
+    separate_reasoning = os.environ["SEPARATE_REASONING"].strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if separate_reasoning and model_is_deepseek_v32:
+        reasoning, content = ReasoningParser("deepseek-v3").parse_non_stream(text)
     return {
-        "content": message.get("content"),
-        "reasoning_content": message.get("reasoning_content"),
-        "finish_reason": choice.get("finish_reason"),
-        "usage": resp.get("usage"),
+        "text": text,
+        "content": content or "",
+        "reasoning_content": reasoning or "",
+        "finish_reason": (resp.get("meta_info") or {}).get("finish_reason"),
+        "usage": resp.get("meta_info") or {},
     }
 
 
