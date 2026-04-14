@@ -1,6 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
+import time
 from typing import List, NamedTuple
 
 import torch
@@ -165,6 +166,12 @@ class HiSparseCoordinator:
         self._stats_step_count = 0
         self._stats_log_interval = 40
         self._last_num_reqs = 0
+        # Heartbeat: overall-avg summary every ~1s (no per-layer detail, no reset).
+        self._heartbeat_interval_s = 1.0
+        self._heartbeat_last_time = time.monotonic()
+        self._heartbeat_last_resolve_sum = 0
+        self._heartbeat_last_prefetch_sum = 0
+        self._heartbeat_last_steps = 0
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -463,6 +470,41 @@ class HiSparseCoordinator:
                 self._prefetch_stats[lid][1] += int(prefetch_cpu[lid, 1])
 
         self._stats_step_count += 1
+        self._maybe_log_heartbeat()
+
+    def _maybe_log_heartbeat(self) -> None:
+        """Emit an overall-avg summary every ~1s (no per-layer detail, no reset)."""
+        if self.tp_rank != 0:
+            return
+        now = time.monotonic()
+        elapsed = now - self._heartbeat_last_time
+        if elapsed < self._heartbeat_interval_s:
+            return
+
+        layer_num = self.mem_pool_device.layer_num
+        resolve_sum = sum(self._resolve_stats[lid][0] for lid in range(layer_num))
+        prefetch_sum = sum(self._prefetch_stats[lid][0] for lid in range(layer_num))
+
+        steps_delta = self._stats_step_count - self._heartbeat_last_steps
+        resolve_delta = resolve_sum - self._heartbeat_last_resolve_sum
+        prefetch_delta = prefetch_sum - self._heartbeat_last_prefetch_sum
+
+        if steps_delta > 0:
+            denom = steps_delta * layer_num
+            resolve_avg = resolve_delta / denom
+            msg = (
+                f"HiSparse heartbeat ({elapsed:.1f}s, {steps_delta} steps): "
+                f"resolve miss avg={resolve_avg:.1f} tok/layer/step"
+            )
+            if self.enable_prefetch:
+                prefetch_avg = prefetch_delta / denom
+                msg += f", prefetch copy avg={prefetch_avg:.1f} tok/layer/step"
+            logger.info(msg)
+
+        self._heartbeat_last_time = now
+        self._heartbeat_last_resolve_sum = resolve_sum
+        self._heartbeat_last_prefetch_sum = prefetch_sum
+        self._heartbeat_last_steps = self._stats_step_count
 
     def _log_and_reset_stats(self) -> None:
         """Log accumulated stats and reset counters.  Only logs on TP rank 0."""
@@ -475,57 +517,66 @@ class HiSparseCoordinator:
         if steps == 0:
             return
 
-        # Collect per-layer resolve miss rates and overall average.
+        # Collect per-layer resolve miss counts (avg per decode step).
         # Stats layout: [0] = misses (swap-in count), [1] = total_topk.
         total_misses_all = 0
-        total_topk_all = 0
-        miss_rates = []
+        avg_misses_per_step = []
         for lid in range(layer_num):
-            misses, total_topk = self._resolve_stats[lid]
+            misses, _ = self._resolve_stats[lid]
             total_misses_all += misses
-            total_topk_all += total_topk
-            miss_rates.append(misses / total_topk if total_topk > 0 else 0.0)
+            avg_misses_per_step.append(misses / steps if steps > 0 else 0.0)
 
-        avg_miss = total_misses_all / total_topk_all if total_topk_all > 0 else 0.0
+        avg_misses_overall = (
+            total_misses_all / (steps * layer_num) if steps > 0 else 0.0
+        )
 
         # Per-layer detail: group into rows of 10 for readability.
         layer_lines = []
         for start in range(0, layer_num, 10):
             end = min(start + 10, layer_num)
-            parts = [f"L{lid:>2d}:{miss_rates[lid]:5.1%}" for lid in range(start, end)]
+            parts = [
+                f"L{lid:>2d}:{avg_misses_per_step[lid]:7.1f}"
+                for lid in range(start, end)
+            ]
             layer_lines.append("  " + "  ".join(parts))
 
         logger.info(
-            "HiSparse resolve miss rate (%d steps, avg=%s):\n%s",
+            "HiSparse resolve miss count/step (%d steps, "
+            "overall avg=%.1f tokens/layer/step):\n%s",
             steps,
-            f"{avg_miss:.1%}",
+            avg_misses_overall,
             "\n".join(layer_lines),
         )
 
         if self.enable_prefetch:
-            pfx_misses_all = 0
-            pfx_topk_all = 0
-            hit_rates = []
+            # In PREFETCH mode, stats[0] is H2D copy count (capped at num_max_prefetch).
+            pfx_copies_all = 0
+            avg_copies_per_step = []
             for lid in range(layer_num):
-                misses, total_topk = self._prefetch_stats[lid]
-                pfx_misses_all += misses
-                pfx_topk_all += total_topk
-                hit_rate = 1.0 - (misses / total_topk) if total_topk > 0 else 0.0
-                hit_rates.append(hit_rate)
+                copies, _ = self._prefetch_stats[lid]
+                pfx_copies_all += copies
+                avg_copies_per_step.append(copies / steps if steps > 0 else 0.0)
 
-            avg_hit = 1.0 - (pfx_misses_all / pfx_topk_all) if pfx_topk_all > 0 else 0.0
+            avg_copies_overall = (
+                pfx_copies_all / (steps * layer_num) if steps > 0 else 0.0
+            )
 
-            pfx_lines = []
+            copy_lines = []
             for start in range(0, layer_num, 10):
                 end = min(start + 10, layer_num)
-                parts = [f"L{lid:>2d}:{hit_rates[lid]:5.1%}" for lid in range(start, end)]
-                pfx_lines.append("  " + "  ".join(parts))
+                parts = [
+                    f"L{lid:>2d}:{avg_copies_per_step[lid]:7.1f}"
+                    for lid in range(start, end)
+                ]
+                copy_lines.append("  " + "  ".join(parts))
 
             logger.info(
-                "HiSparse prefetch hit rate (%d steps, avg=%s):\n%s",
+                "HiSparse prefetch copy count/step (cap=%d, %d steps, "
+                "overall avg=%.1f tokens/layer/step):\n%s",
+                self.num_max_prefetch,
                 steps,
-                f"{avg_hit:.1%}",
-                "\n".join(pfx_lines),
+                avg_copies_overall,
+                "\n".join(copy_lines),
             )
 
         self._reset_stats()
@@ -537,6 +588,11 @@ class HiSparseCoordinator:
             self._resolve_stats[lid] = [0, 0]
             self._prefetch_stats[lid] = [0, 0]
         self._stats_step_count = 0
+        # Keep heartbeat's deltas aligned with the zeroed accumulators.
+        self._heartbeat_last_resolve_sum = 0
+        self._heartbeat_last_prefetch_sum = 0
+        self._heartbeat_last_steps = 0
+        self._heartbeat_last_time = time.monotonic()
 
     def _eager_backup_previous_token(
         self,

@@ -2148,7 +2148,7 @@ class DeepseekV2Model(nn.Module):
                 if (
                     forward_batch.hisparse_coordinator is not None
                     and forward_batch.hisparse_coordinator.enable_prefetch
-                    and forward_batch.forward_mode.is_decode_or_idle()
+                    and forward_batch.forward_mode.is_decode()
                     and i + 1 < normal_end_layer
                 ):
                     next_layer = self.layers[i + 1]

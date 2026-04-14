@@ -13,15 +13,18 @@ fi
 
 export PYTHONPATH="${ROOT_DIR}/python${PYTHONPATH:+:${PYTHONPATH}}"
 
-MODEL_PATH="${MODEL_PATH:-/data/dark/tmp/workspace/DeepSeekV3.2}"
+MODEL_PATH="${MODEL_PATH:-/data/dark/workspace/DeepSeekV3.2}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-30304}"
-TP="${TP:-1}"
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.91}"
+TP="${TP:-8}"
+DP="${DP:-8}"
+ENABLE_DP_ATTENTION="${ENABLE_DP_ATTENTION:-1}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-bfloat16}"
 CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-8}"
 ENABLE_TRUNCATED_LAYERS="${ENABLE_TRUNCATED_LAYERS:-0}"
 TRUNCATED_NUM_HIDDEN_LAYERS="${TRUNCATED_NUM_HIDDEN_LAYERS:-4}"
+ENABLE_HISPARSE="${ENABLE_HISPARSE:-1}"
 
 # ── HiSparse config (built from individual knobs) ────────────────────
 HISPARSE_TOP_K="${HISPARSE_TOP_K:-2048}"
@@ -55,16 +58,26 @@ launch_args=(
   --model-path "${MODEL_PATH}"
   --host "${HOST}"
   --port "${PORT}"
-  --tp "${TP}"
+  --tp-size "${TP}"
+  --dp-size "${DP}"
   --trust-remote-code
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
   --disable-radix-cache
-  --enable-hisparse
-  --hisparse-config "${HISPARSE_CONFIG}"
   --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS}"
   --reasoning-parser deepseek-v3
   --tool-call-parser deepseekv32
 )
+
+if [[ "${ENABLE_HISPARSE}" == "1" ]]; then
+  launch_args+=(
+    --enable-hisparse
+    --hisparse-config "${HISPARSE_CONFIG}"
+  )
+fi
+
+if [[ "${ENABLE_DP_ATTENTION}" == "1" ]]; then
+  launch_args+=(--enable-dp-attention)
+fi
 
 if [[ "${has_manual_kv_cache_dtype}" == "0" ]]; then
   launch_args+=(
